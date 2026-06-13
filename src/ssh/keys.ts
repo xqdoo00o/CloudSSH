@@ -37,12 +37,17 @@ export class KeyDerivation {
     const result = new Uint8Array(needed);
     let offset = 0;
 
-    // session_id must be encoded as SSH string (4-byte length prefix + value)
+    const HStr = encodeString(H);
     const sessionIdStr = encodeString(sessionId);
+    const XBytes = new TextEncoder().encode(X);
+
+    if (X === 'A') {
+      console.log('[KDF] Input lengths: K=' + K.length + ' H=' + H.length + ' HStr=' + HStr.length + ' X=' + XBytes.length + ' sessionId=' + sessionId.length + ' sessionIdStr=' + sessionIdStr.length);
+    }
 
     let key = new Uint8Array(
       await crypto.subtle.digest('SHA-256',
-        concat(K, H, new TextEncoder().encode(X), sessionIdStr)
+        concat(K, HStr, XBytes, sessionIdStr)
       )
     );
     result.set(key.slice(0, Math.min(hashLen, needed)), 0);
@@ -51,7 +56,7 @@ export class KeyDerivation {
     for (let i = 1; i < rounds; i++) {
       key = new Uint8Array(
         await crypto.subtle.digest('SHA-256',
-          concat(K, H, key, sessionIdStr)
+          concat(K, HStr, key, sessionIdStr)
         )
       );
       const remaining = needed - offset;

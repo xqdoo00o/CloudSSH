@@ -74,3 +74,4 @@ export const SSH_MSG_CHANNEL_CLOSE = 97;
 export const SSH_MSG_CHANNEL_REQUEST = 98;
 export const SSH_MSG_CHANNEL_SUCCESS = 99;
 export const SSH_MSG_CHANNEL_FAILURE = 100;
+export const SSH_MSG_CHANNEL_OPEN_FAILURE = 92;

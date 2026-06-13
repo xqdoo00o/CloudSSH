@@ -9,13 +9,16 @@ import {
   SSH_MSG_USERAUTH_FAILURE,
   SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
   SSH_MSG_CHANNEL_SUCCESS,
+  SSH_MSG_CHANNEL_FAILURE,
   SSH_MSG_CHANNEL_DATA,
   SSH_MSG_CHANNEL_WINDOW_ADJUST,
   SSH_MSG_CHANNEL_EOF,
   SSH_MSG_CHANNEL_CLOSE,
   SSH_MSG_DISCONNECT,
   SSH_MSG_IGNORE,
-  SSH_MSG_DEBUG
+  SSH_MSG_DEBUG,
+  SSH_MSG_UNIMPLEMENTED,
+  SSH_MSG_CHANNEL_OPEN_FAILURE,
 } from '../types';
 import { SSHTransport } from '../ssh/transport';
 import { SSHPacketParser, SSHPacketBuilder } from '../ssh/packet';
@@ -25,6 +28,15 @@ import { KeyDerivation } from '../ssh/keys';
 import { SSHAESGCMCipher } from '../ssh/crypto';
 import { SSHAuth } from '../ssh/auth';
 import { SSHChannel } from '../ssh/channel';
+
+function findCRLF(data: Uint8Array): number {
+  for (let i = 0; i < data.length - 1; i++) {
+    if (data[i] === 0x0d && data[i + 1] === 0x0a) {
+      return i;
+    }
+  }
+  return -1;
+}
 
 export class SSHSession {
   private ws: WebSocket;
@@ -39,7 +51,6 @@ export class SSHSession {
   private derivedKeys: any = null;
 
   private seqNumSend: number = 0;
-  private seqNumRecv: number = 0;
   private sessionID: Uint8Array | null = null;
 
   private kexInitLocal: Uint8Array | null = null;
@@ -52,7 +63,6 @@ export class SSHSession {
     = 'connecting';
 
   constructor(ws: WebSocket, socket: any, config: SSHConnectionConfig) {
-    console.log('[SSH] Constructor called');
     this.ws = ws;
     this.socket = socket;
     this.config = config;
@@ -62,66 +72,65 @@ export class SSHSession {
   }
 
   async startHandshake(): Promise<void> {
-    console.log('[SSH] Starting handshake, current state:', this.state);
-    this.ws.send(JSON.stringify({ type: 'status', message: '正在交换版本信息...' }));
+    this.sendStatus('正在交换版本信息...');
     this.state = 'version';
-    console.log('[SSH] State changed to: version');
-    
+
     const writer = this.socket.writable.getWriter();
-    const versionStr = 'SSH-2.0-CloudSSH_1.0\r\n';
-    console.log('[SSH] Sending version string:', versionStr.trim());
-    await writer.write(new TextEncoder().encode(versionStr));
+    await writer.write(new TextEncoder().encode('SSH-2.0-CloudSSH_1.0\r\n'));
     writer.releaseLock();
-    console.log('[SSH] Version string sent');
-    
+
     this.startReading();
   }
 
   private async startReading(): Promise<void> {
-    console.log('[SSH] Starting read loop');
     const reader = this.socket.readable.getReader();
     const decoder = new TextDecoder();
 
+    let leftover: Uint8Array | null = null;
+
     try {
       while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          console.log('[SSH] TCP stream ended');
-          break;
+        let value: Uint8Array;
+        if (leftover) {
+          value = leftover;
+          leftover = null;
+        } else {
+          const result = await reader.read();
+          if (result.done) break;
+          value = result.value;
         }
 
-        console.log('[SSH] Received data, state:', this.state, 'bytes:', value.length);
-
         if (this.state === 'version') {
-          const versionStr = decoder.decode(value);
-          console.log('[SSH] Server version:', versionStr.trim());
-          if (this.transport.handleVersionExchange(versionStr)) {
-            console.log('[SSH] Version exchange complete');
-            this.ws.send(JSON.stringify({ type: 'status', message: '版本交换完成，正在密钥协商...' }));
-            this.state = 'kex';
-            console.log('[SSH] State changed to: kex');
-            await this.startKEX();
+          const crlfIndex = findCRLF(value);
+          if (crlfIndex === -1) {
+            this.transport.handleVersionExchange(decoder.decode(value));
+            continue;
+          }
+
+          const versionPart = value.slice(0, crlfIndex + 2);
+          const remaining = value.slice(crlfIndex + 2);
+          this.transport.handleVersionExchange(decoder.decode(versionPart));
+          console.log('[SSH] Version exchange complete, remote=' + this.transport.getRemoteVersion());
+          this.sendStatus('版本交换完成，正在密钥协商...');
+          this.state = 'kex';
+          await this.startKEX();
+
+          if (remaining.length > 0) {
+            console.log('[SSH] Remaining data after version: ' + remaining.length + ' bytes');
+            this.packetParser.feed(remaining);
+            await this.processPackets();
           }
         } else {
-          try {
-            this.packetParser.feed(value);
-            await this.processPackets();
-          } catch (pktError) {
-            const pktErrMsg = pktError instanceof Error ? pktError.message : String(pktError);
-            console.error('[SSH] Packet processing error:', pktErrMsg);
-            throw pktError;
-          }
+          console.log('[SSH] Received ' + value.length + ' bytes, state=' + this.state);
+          this.packetParser.feed(value);
+          await this.processPackets();
         }
       }
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      const errStack = error instanceof Error ? error.stack : '';
-      console.error('[SSH] Read loop error:', errMsg, errStack);
+      console.error('[SSH] Read loop error:', errMsg);
       try {
-        this.ws.send(JSON.stringify({
-          type: 'error',
-          message: 'SSH 连接断开: ' + errMsg
-        }));
+        this.ws.send(JSON.stringify({ type: 'error', message: 'SSH 连接断开: ' + errMsg }));
       } catch {}
     }
   }
@@ -129,31 +138,22 @@ export class SSHSession {
   private async startKEX(): Promise<void> {
     console.log('[KEX] Starting key exchange');
     this.kexInitLocal = KEXInitBuilder.build();
-    console.log('[KEX] Built KEXINIT, length:', this.kexInitLocal.length);
-    
+
     const packet = await SSHPacketBuilder.build(
       this.kexInitLocal, 8, null, this.seqNumSend++
     );
-    console.log('[KEX] Sending KEXINIT packet, length:', packet.length);
     await this.writeSocket(packet);
     console.log('[KEX] KEXINIT sent');
 
-    console.log('[KEX] Generating ECDH key pair...');
     this.ecdhKeyPair = await ECDHKeyExchange.generateKeyPair();
-    console.log('[KEX] ECDH key pair generated');
-    
-    this.ecdhRawPublicKey = await ECDHKeyExchange.exportRawPublicKey(
-      this.ecdhKeyPair
-    );
-    console.log('[KEX] Raw public key exported, length:', this.ecdhRawPublicKey.length);
+    this.ecdhRawPublicKey = await ECDHKeyExchange.exportRawPublicKey(this.ecdhKeyPair);
 
     const ecdhInit = ECDHKeyExchange.buildInit(this.ecdhRawPublicKey);
     const ecdhPacket = await SSHPacketBuilder.build(
       ecdhInit, 8, null, this.seqNumSend++
     );
-    console.log('[KEX] Sending ECDH_INIT packet, length:', ecdhPacket.length);
     await this.writeSocket(ecdhPacket);
-    console.log('[KEX] ECDH_INIT sent, waiting for server reply...');
+    console.log('[KEX] ECDH_INIT sent, waiting for server reply');
   }
 
   private async writeSocket(data: Uint8Array): Promise<void> {
@@ -164,6 +164,7 @@ export class SSHSession {
 
   private async processPackets(): Promise<void> {
     const blockSize = this.decryptCipher ? 16 : 8;
+    console.log('[PKT] processPackets: blockSize=' + blockSize + ', hasDecrypt=' + !!this.decryptCipher + ', bufferLen=' + this.packetParser.getBufferLength());
 
     while (true) {
       const packet = await this.packetParser.nextPacket(
@@ -174,11 +175,12 @@ export class SSHSession {
         !!this.decryptCipher
       );
 
-      if (!packet) break;
+      if (!packet) {
+        console.log('[PKT] No more packets, buffer remaining: ' + this.packetParser.getBufferLength());
+        break;
+      }
 
-      const msgType = packet.payload[0];
-      console.log('[PKT] Received message type:', msgType, 'state:', this.state);
-
+      console.log('[PKT] Received msgType=' + packet.payload[0] + ', state=' + this.state + ', payloadLen=' + packet.payload.length);
       await this.handlePacket(packet);
     }
   }
@@ -203,10 +205,11 @@ export class SSHSession {
   }
 
   private async handleKEXPacket(msgType: number, payload: Uint8Array): Promise<void> {
+    console.log('[KEX] handleKEXPacket: msgType=' + msgType);
     switch (msgType) {
       case SSH_MSG_KEXINIT:
-        console.log('[KEX] Received KEXINIT from server');
         this.kexInitRemote = payload;
+        console.log('[KEX] Received KEXINIT from server');
         break;
 
       case SSH_MSG_KEX_ECDH_REPLY:
@@ -214,25 +217,36 @@ export class SSHSession {
         await this.handleECDHReply(payload);
         break;
 
-      case SSH_MSG_NEWKEYS:
-        console.log('[KEX] Received NEWKEYS from server');
-
+      case SSH_MSG_NEWKEYS: {
+        console.log('[KEX] Received NEWKEYS from server, seqNumSend=' + this.seqNumSend);
         const newKeys = new Uint8Array([SSH_MSG_NEWKEYS]);
         const packet = await SSHPacketBuilder.build(
           newKeys, 8, null, this.seqNumSend++
         );
         await this.writeSocket(packet);
-        console.log('[KEX] NEWKEYS sent, seqNumSend:', this.seqNumSend);
+        console.log('[KEX] Client NEWKEYS sent, seqNumSend=' + this.seqNumSend);
 
-        this.seqNumSend = 0;
-        this.packetParser.resetSeqNum();
         await this.enableEncryption();
         console.log('[KEX] Encryption enabled');
-
         this.state = 'auth';
-        console.log('[SSH] State changed to: auth');
-        this.ws.send(JSON.stringify({ type: 'status', message: '加密已启用，正在请求认证服务...' }));
-        await this.sendServiceRequest();
+        try {
+          await this.sendServiceRequest();
+          console.log('[AUTH] SERVICE_REQUEST sent');
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e);
+          console.error('[AUTH] SERVICE_REQUEST failed:', errMsg);
+          this.sendError('密钥协商失败: ' + errMsg);
+          this.close();
+        }
+        break;
+      }
+
+      case SSH_MSG_UNIMPLEMENTED:
+        console.warn('[KEX] Server sent UNIMPLEMENTED');
+        break;
+
+      default:
+        console.warn('[KEX] Unexpected msgType=' + msgType + ' in kex state');
         break;
     }
   }
@@ -241,16 +255,23 @@ export class SSHSession {
     console.log('[KEX] Parsing ECDH_REPLY...');
     const { hostKey, serverRawPublicKey, signature } =
       ECDHKeyExchange.parseReply(payload);
-    console.log('[KEX] ECDH_REPLY parsed, hostKey:', hostKey.length, 'serverPubKey:', serverRawPublicKey.length, 'sig:', signature.length);
+    console.log('[KEX] ECDH_REPLY parsed: hostKey=' + hostKey.length + ', serverPubKey=' + serverRawPublicKey.length + ', sig=' + signature.length);
 
     console.log('[KEX] Computing shared secret...');
     const sharedSecret = await ECDHKeyExchange.computeSharedSecret(
       this.ecdhKeyPair.privateKey,
       serverRawPublicKey
     );
-    console.log('[KEX] Shared secret computed, length:', sharedSecret.length);
+    console.log('[KEX] Shared secret computed: ' + sharedSecret.length + ' bytes');
 
     console.log('[KEX] Computing exchange hash...');
+    const localVer = this.transport.getLocalVersion();
+    const remoteVer = this.transport.getRemoteVersion();
+    console.log('[KEX] localVer="' + localVer + '" len=' + localVer.length);
+    console.log('[KEX] remoteVer="' + remoteVer + '" len=' + remoteVer.length);
+    console.log('[KEX] kexInitLocal len=' + this.kexInitLocal!.length + ' kexInitRemote len=' + this.kexInitRemote!.length);
+    console.log('[KEX] hostKey len=' + hostKey.length + ' clientPubKey len=' + this.ecdhRawPublicKey.length + ' serverPubKey len=' + serverRawPublicKey.length);
+    console.log('[KEX] sharedSecret len=' + sharedSecret.length);
     const H = await ECDHKeyExchange.computeExchangeHash(
       this.transport.getLocalVersion(),
       this.transport.getRemoteVersion(),
@@ -261,7 +282,8 @@ export class SSHSession {
       serverRawPublicKey,
       sharedSecret
     );
-    console.log('[KEX] Exchange hash computed');
+    console.log('[KEX] Exchange hash hex=' + Array.from(H).map(b => b.toString(16).padStart(2, '0')).join(''));
+    console.log('[KEX] sharedSecret hex=' + Array.from(sharedSecret).map(b => b.toString(16).padStart(2, '0')).join(''));
 
     if (!this.sessionID) {
       this.sessionID = H;
@@ -270,12 +292,16 @@ export class SSHSession {
 
     console.log('[KEX] Deriving keys...');
     this.derivedKeys = await KeyDerivation.deriveKeys(sharedSecret, H, this.sessionID!);
-    console.log('[KEX] Keys derived, waiting for NEWKEYS...');
+    console.log('[KEX] Keys derived, waiting for NEWKEYS');
   }
 
   private async enableEncryption(): Promise<void> {
-    console.log('[KEX] Enabling encryption...');
     const keys = this.derivedKeys;
+    console.log('[KEX] encKeyC2S len=' + keys.encKeyClientToServer.length + ', ivC2S len=' + keys.ivClientToServer.length);
+    console.log('[KEX] ivC2S hex=' + Array.from(keys.ivClientToServer).map(b => b.toString(16).padStart(2, '0')).join(''));
+    console.log('[KEX] encKeyC2S hex=' + Array.from(keys.encKeyClientToServer).map(b => b.toString(16).padStart(2, '0')).join(''));
+    console.log('[KEX] ivS2C hex=' + Array.from(keys.ivServerToClient).map(b => b.toString(16).padStart(2, '0')).join(''));
+    console.log('[KEX] encKeyS2C hex=' + Array.from(keys.encKeyServerToClient).map(b => b.toString(16).padStart(2, '0')).join(''));
 
     this.encryptCipher = new SSHAESGCMCipher(
       keys.encKeyClientToServer,
@@ -288,37 +314,50 @@ export class SSHSession {
       keys.ivServerToClient
     );
     await this.decryptCipher.init();
-    console.log('[KEX] Encryption ciphers ready');
+
+    try {
+      const testPlain = new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f]);
+      const testAad = new Uint8Array([0, 0, 0, 5]);
+      const testEnc = await this.encryptCipher.encrypt(testPlain, 0, testAad);
+      console.log('[KEX] Round-trip test: encrypted ' + testPlain.length + ' -> ' + testEnc.length + ' bytes');
+      const testDec = await this.encryptCipher.decrypt(testEnc, 0, testAad);
+      const match = testDec && testDec.length === testPlain.length && testDec.every((b, i) => b === testPlain[i]);
+      console.log('[KEX] Round-trip test: ' + (match ? 'PASS' : 'FAIL'));
+    } catch (e) {
+      console.error('[KEX] Round-trip test ERROR:', e instanceof Error ? e.message : String(e));
+    }
   }
 
   private async sendServiceRequest(): Promise<void> {
-    console.log('[AUTH] Sending SERVICE_REQUEST for ssh-userauth...');
     const serviceName = 'ssh-userauth';
-    const encoder = new TextEncoder();
-    const nameBytes = encoder.encode(serviceName);
+    const nameBytes = new TextEncoder().encode(serviceName);
     const serviceRequest = new Uint8Array(1 + 4 + nameBytes.length);
     serviceRequest[0] = SSH_MSG_SERVICE_REQUEST;
-    const view = new DataView(serviceRequest.buffer);
-    view.setUint32(1, nameBytes.length, false);
+    new DataView(serviceRequest.buffer).setUint32(1, nameBytes.length, false);
     serviceRequest.set(nameBytes, 5);
+
+    console.log('[AUTH] SERVICE_REQUEST payload len=' + serviceRequest.length + ', seqNum=' + this.seqNumSend);
+    console.log('[AUTH] encryptCipher exists=' + !!this.encryptCipher);
 
     const packet = await SSHPacketBuilder.build(
       serviceRequest, 16,
-      (data, seq, aad) => this.encryptCipher!.encrypt(data, seq, aad),
+      (data, seq, aad) => {
+        console.log('[AUTH] Encrypting: dataLen=' + data.length + ', seq=' + seq + ', aadLen=' + aad?.length);
+        return this.encryptCipher!.encrypt(data, seq, aad);
+      },
       this.seqNumSend++,
       true
     );
+    console.log('[AUTH] Encrypted packet len=' + packet.length + ', first16=' + Array.from(packet.slice(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(''));
     await this.writeSocket(packet);
-    console.log('[AUTH] SERVICE_REQUEST sent');
+    console.log('[AUTH] SERVICE_REQUEST sent to socket');
   }
 
   private async authenticate(): Promise<void> {
-    console.log('[AUTH] Sending password authentication...');
     const authRequest = SSHAuth.buildPasswordAuthRequest(
       this.config.username,
       this.config.password
     );
-    console.log('[AUTH] Auth request built, length:', authRequest.length);
 
     const packet = await SSHPacketBuilder.build(
       authRequest, 16,
@@ -327,127 +366,111 @@ export class SSHSession {
       true
     );
     await this.writeSocket(packet);
-    console.log('[AUTH] Auth request sent');
   }
 
   private async handleAuthPacket(msgType: number, payload: Uint8Array): Promise<void> {
     switch (msgType) {
       case SSH_MSG_SERVICE_ACCEPT:
-        console.log('[AUTH] SERVICE_ACCEPT received, sending password auth...');
-        this.ws.send(JSON.stringify({ type: 'status', message: '认证服务已接受，正在认证...' }));
+        this.sendStatus('认证服务已接受，正在认证...');
         await this.authenticate();
         break;
 
       case SSH_MSG_USERAUTH_SUCCESS:
-        console.log('[AUTH] Authentication successful!');
-        this.ws.send(JSON.stringify({
-          type: 'status',
-          message: '认证成功'
-        }));
+        this.sendStatus('认证成功');
         this.state = 'shell';
-        console.log('[SSH] State changed to: shell');
         await this.openShell();
         break;
 
       case SSH_MSG_USERAUTH_FAILURE:
-        console.log('[AUTH] Authentication failed');
-        this.ws.send(JSON.stringify({
-          type: 'error',
-          message: '认证失败：用户名或密码错误'
-        }));
+        this.sendError('认证失败：用户名或密码错误');
         this.close();
+        break;
+
+      case SSH_MSG_UNIMPLEMENTED:
+        console.warn('[AUTH] Server sent UNIMPLEMENTED');
         break;
     }
   }
 
   private async openShell(): Promise<void> {
-    console.log('[SHELL] Opening session channel...');
     const openMsg = this.channel.buildOpenSession();
     await this.sendEncrypted(openMsg);
-    console.log('[SHELL] Channel open request sent');
   }
 
   private async handleSessionPacket(msgType: number, payload: Uint8Array): Promise<void> {
-    console.log('[SESSION] Received message type:', msgType);
     switch (msgType) {
       case SSH_MSG_CHANNEL_OPEN_CONFIRMATION:
-        console.log('[SESSION] Channel opened successfully');
         this.channel.handleOpenConfirmation(payload);
-        console.log('[SESSION] Sending PTY request...');
         const ptyReq = this.channel.buildPTYRequest(120, 40);
         await this.sendEncrypted(ptyReq);
-        console.log('[SESSION] PTY request sent');
+        break;
+
+      case SSH_MSG_CHANNEL_OPEN_FAILURE:
+        this.sendError('通道打开被拒绝');
+        this.close();
         break;
 
       case SSH_MSG_CHANNEL_SUCCESS:
-        console.log('[SESSION] Channel success, state:', this.state);
         if (this.state === 'shell') {
-          console.log('[SESSION] Sending shell request...');
           const shellReq = this.channel.buildShellRequest();
           await this.sendEncrypted(shellReq);
           this.state = 'ready';
-          console.log('[SSH] State changed to: ready - SHELL ACTIVE!');
+          this.sendStatus('Shell 已就绪');
         }
         break;
 
-      case SSH_MSG_CHANNEL_DATA:
-        const outputData = this.channel.handleChannelData(payload);
-        this.ws.send(outputData.slice().buffer);
+      case SSH_MSG_CHANNEL_FAILURE:
+        if (this.state === 'shell') {
+          this.sendError('PTY 或 Shell 请求被拒绝');
+          this.close();
+        }
         break;
 
+      case SSH_MSG_CHANNEL_DATA: {
+        const outputData = this.channel.handleChannelData(payload);
+        this.ws.send(outputData.slice().buffer as ArrayBuffer);
+        break;
+      }
+
       case SSH_MSG_CHANNEL_WINDOW_ADJUST:
-        console.log('[SESSION] Window adjust');
         break;
 
       case SSH_MSG_CHANNEL_EOF:
       case SSH_MSG_CHANNEL_CLOSE:
-        console.log('[SESSION] Channel closed');
-        this.ws.send(JSON.stringify({
-          type: 'status',
-          message: '会话已结束'
-        }));
+        this.sendStatus('会话已结束');
         this.close();
         break;
 
       case SSH_MSG_DISCONNECT:
-        console.log('[SESSION] Server disconnected');
-        this.ws.send(JSON.stringify({
-          type: 'status',
-          message: '服务器断开连接'
-        }));
+        this.sendStatus('服务器断开连接');
         this.close();
         break;
 
       case SSH_MSG_IGNORE:
       case SSH_MSG_DEBUG:
+      case SSH_MSG_UNIMPLEMENTED:
         break;
     }
   }
 
-  handleWebSocketMessage(data: string | ArrayBuffer): void {
-    if (this.state !== 'ready') {
-      console.log('[INPUT] Ignoring input, state:', this.state);
-      return;
-    }
+  async handleWebSocketMessage(data: string | ArrayBuffer): Promise<void> {
+    if (this.state !== 'ready') return;
 
     if (typeof data === 'string') {
       try {
         const msg = JSON.parse(data);
         if (msg.type === 'resize') {
-          console.log('[INPUT] Terminal resize:', msg.cols, 'x', msg.rows);
-          this.handleResize(msg.cols, msg.rows);
+          await this.handleResize(msg.cols, msg.rows);
           return;
         }
       } catch {
         const encoded = new TextEncoder().encode(data);
         const channelData = this.channel.buildChannelData(encoded);
-        this.sendEncrypted(channelData);
+        await this.sendEncrypted(channelData);
       }
     } else {
-      const channelData = this.channel.buildChannelData(
-        new Uint8Array(data)
-      );
-      this.sendEncrypted(channelData);
+      const channelData = this.channel.buildChannelData(new Uint8Array(data));
+      await this.sendEncrypted(channelData);
     }
   }
 
@@ -470,8 +493,19 @@ export class SSHSession {
     await this.writeSocket(encrypted);
   }
 
+  private sendStatus(message: string): void {
+    try {
+      this.ws.send(JSON.stringify({ type: 'status', message }));
+    } catch {}
+  }
+
+  private sendError(message: string): void {
+    try {
+      this.ws.send(JSON.stringify({ type: 'error', message }));
+    } catch {}
+  }
+
   close(): void {
-    console.log('[SSH] Closing session');
     try { this.socket.close(); } catch {}
     try { this.ws.close(); } catch {}
   }

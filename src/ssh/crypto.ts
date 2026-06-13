@@ -21,9 +21,11 @@ export class SSHAESGCMCipher {
 
   private buildNonce(seqNum: number): Uint8Array {
     const nonce = new Uint8Array(this.baseIV);
-    const view = new DataView(nonce.buffer);
-    const lo = view.getUint32(8, false);
-    view.setUint32(8, lo ^ seqNum, false);
+    nonce[8] ^= (seqNum >>> 24) & 0xff;
+    nonce[9] ^= (seqNum >>> 16) & 0xff;
+    nonce[10] ^= (seqNum >>> 8) & 0xff;
+    nonce[11] ^= seqNum & 0xff;
+    console.log('[CRYPTO] buildNonce: seqNum=' + seqNum + ', nonce=' + Array.from(nonce).map(b => b.toString(16).padStart(2, '0')).join(''));
     return nonce;
   }
 
@@ -56,6 +58,7 @@ export class SSHAESGCMCipher {
       );
       return decrypted;
     } catch (e) {
+      console.error('[CRYPTO] Decrypt failed, seqNum:', seq, 'ciphertextLen:', ciphertext.length, 'error:', e instanceof Error ? e.message : String(e));
       return null;
     }
   }

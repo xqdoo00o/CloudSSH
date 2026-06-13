@@ -78,16 +78,23 @@ export class ECDHKeyExchange {
     serverRawPublicKey: Uint8Array,
     sharedSecret: Uint8Array
   ): Promise<Uint8Array> {
-    const data = concat(
-      encodeString(clientVersion),
-      encodeString(serverVersion),
-      encodeString(clientKEXInit),
-      encodeString(serverKEXInit),
-      encodeString(hostKey),
-      encodeString(clientRawPublicKey),
-      encodeString(serverRawPublicKey),
-      sharedSecret
-    );
+    const v_c = encodeString(clientVersion);
+    const v_s = encodeString(serverVersion);
+    const i_c = encodeString(clientKEXInit);
+    const i_s = encodeString(serverKEXInit);
+    const k_s = encodeString(hostKey);
+    const e = encodeString(clientRawPublicKey);
+    const f = encodeString(serverRawPublicKey);
+    const k = sharedSecret;
+
+    console.log('[KEX] Hash input lengths: V_C=' + v_c.length + ' V_S=' + v_s.length +
+      ' I_C=' + i_c.length + ' I_S=' + i_s.length +
+      ' K_S=' + k_s.length + ' e=' + e.length + ' f=' + f.length + ' K=' + k.length);
+    console.log('[KEX] V_C hex=' + Array.from(v_c).map(b => b.toString(16).padStart(2, '0')).join(''));
+    console.log('[KEX] V_S hex=' + Array.from(v_s).map(b => b.toString(16).padStart(2, '0')).join(''));
+
+    const data = concat(v_c, v_s, i_c, i_s, k_s, e, f, k);
+    console.log('[KEX] Hash input total length: ' + data.length);
 
     const hashBuffer = await crypto.subtle.digest('SHA-256', data);
     return new Uint8Array(hashBuffer);
