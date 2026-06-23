@@ -37,7 +37,6 @@ export class SSHSessionDO {
   private state: DurableObjectState;
   private env: Env;
   private sessions: Map<WebSocket, SSHSession> = new Map();
-  private _pendingTimeouts: Map<WebSocket, ReturnType<typeof setTimeout>> = new Map();
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -66,14 +65,33 @@ export class SSHSessionDO {
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
 
-    // Use Hibernation API for long-lived WebSocket connections
-    this.state.acceptWebSocket(server);
+    // 不使用 Hibernation API (acceptWebSocket)，因为 SSH 会话需要保持持久的
+    // TCP 连接。Hibernation API 会在 handler 返回后休眠 DO，导致 TCP socket
+    // 被销毁（Stream was cancelled），SSH 连接断开。
+    server.accept();
+
+    // 公共：连接关闭 / 错误处理
+    const handleClose = () => {
+      const session = this.sessions.get(server);
+      if (session) {
+        session.close();
+        this.sessions.delete(server);
+      }
+    };
+    server.addEventListener('close', handleClose);
+    server.addEventListener('error', handleClose);
 
     if (prefilledConfig) {
       // 预填充模式：直接发起 SSH 连接，不等待前端凭据
-      server.serializeAttachment({ state: 'prefilled' });
-      // 使用 queueMicrotask 确保 WebSocket 就绪后再连接
-      queueMicrotask(async () => {
+      server.addEventListener('message', async (event) => {
+        const session = this.sessions.get(server);
+        if (session) {
+          await session.handleWebSocketMessage(event.data as string | ArrayBuffer);
+        }
+      });
+
+      // 使用 setTimeout 确保 WebSocket 就绪后再连接
+      setTimeout(async () => {
         try {
           await this.initSSHSession(server, prefilledConfig!);
         } catch (e) {
@@ -83,75 +101,47 @@ export class SSHSessionDO {
             server.close(1011, 'SSH connection failed');
           } catch {}
         }
-      });
+      }, 0);
     } else {
       // 匿名模式：等待前端发送凭据
-      // Set a timeout for receiving credentials
-      const timeout = setTimeout(() => {
+      const credentialTimeout = setTimeout(() => {
         try {
           server.send(JSON.stringify({ type: 'error', message: 'Connection timeout' }));
           server.close(1011, 'Timeout');
         } catch {}
       }, 10000);
 
-      server.serializeAttachment({ state: 'waiting', timeout: null });
-      this._pendingTimeouts.set(server, timeout);
+      server.addEventListener('message', async (event) => {
+        const session = this.sessions.get(server);
+        if (session) {
+          await session.handleWebSocketMessage(event.data as string | ArrayBuffer);
+          return;
+        }
+
+        // 第一条消息：凭据
+        clearTimeout(credentialTimeout);
+
+        try {
+          const config = JSON.parse(event.data as string) as SSHConnectionConfig;
+
+          if (!config.host || !config.username || (!config.password && !config.privateKey)) {
+            server.send(JSON.stringify({ type: 'error', message: 'Missing credentials' }));
+            server.close(1011, 'Invalid credentials');
+            return;
+          }
+
+          await this.initSSHSession(server, config);
+        } catch (e) {
+          server.send(JSON.stringify({ type: 'error', message: 'Invalid credentials format' }));
+          server.close(1011, 'Invalid format');
+        }
+      });
     }
 
     return new Response(null, {
       status: 101,
       webSocket: client,
     } as any);
-  }
-
-  // Hibernation API: called when a WebSocket receives a message
-  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    const session = this.sessions.get(ws);
-    if (session) {
-      await session.handleWebSocketMessage(message);
-      return;
-    }
-
-    // This is the first message (credentials)
-    const timeout = this._pendingTimeouts.get(ws);
-    if (timeout) {
-      clearTimeout(timeout);
-      this._pendingTimeouts.delete(ws);
-    }
-
-    try {
-      const config = JSON.parse(message as string) as SSHConnectionConfig;
-
-      if (!config.host || !config.username || (!config.password && !config.privateKey)) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Missing credentials' }));
-        ws.close(1011, 'Invalid credentials');
-        return;
-      }
-
-      await this.initSSHSession(ws, config);
-    } catch (e) {
-      ws.send(JSON.stringify({ type: 'error', message: 'Invalid credentials format' }));
-      ws.close(1011, 'Invalid format');
-    }
-  }
-
-  // Hibernation API: called when a WebSocket is closed
-  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): Promise<void> {
-    const session = this.sessions.get(ws);
-    if (session) {
-      session.close();
-      this.sessions.delete(ws);
-    }
-    const timeout = this._pendingTimeouts.get(ws);
-    if (timeout) {
-      clearTimeout(timeout);
-      this._pendingTimeouts.delete(ws);
-    }
-  }
-
-  // Hibernation API: called when a WebSocket error occurs
-  async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
-    await this.webSocketClose(ws, 1011, 'Error', false);
   }
 
   private async initSSHSession(
