@@ -101,6 +101,14 @@ export class SFTPHandler {
 
     this.sftp.setSendCallback(this.channelDataSend);
     this.sftp.setDebugCallback(sendDebug);
+    this.sftp.setVersionCallback((version: number) => {
+      this.sendDebug(`[SFTP] Version callback: ${version}`);
+      if (!this.ready) {
+        this.ready = true;
+        this.sendDebug(`[SFTP] Version OK (late)`);
+        this.sendJSON({ type: 'sftp_ready' });
+      }
+    });
   }
 
   getChannelID(): number {
@@ -132,9 +140,35 @@ export class SFTPHandler {
       this.sendDebug(`[SFTP] Version OK`);
       this.sendJSON({ type: 'sftp_ready' });
     } catch (e) {
-      this.sendDebug(`[SFTP] Version FAILED: ${e instanceof Error ? e.message : String(e)}`);
-      this.sendJSON({ type: 'sftp_error', message: 'SFTP 版本协商失败: ' + (e instanceof Error ? e.message : String(e)) });
+      this.sendDebug(`[SFTP] Version timeout, waiting for late response...`);
+      // Don't send error yet - wait for late VERSION response
+      // The versionResolve callback in SFTPClient will handle late responses
+      this.waitForLateVersion();
     }
+  }
+
+  private async waitForLateVersion(): Promise<void> {
+    // Wait up to 120 seconds for late VERSION response
+    const maxWait = 120000;
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < maxWait) {
+      if (this.ready) {
+        // VERSION response was received late and processed
+        return;
+      }
+      // Check if channel is still open
+      if (this.channel.isClosed()) {
+        this.sendDebug(`[SFTP] Channel closed while waiting for late VERSION`);
+        this.sendJSON({ type: 'sftp_error', message: 'SFTP 通道已关闭' });
+        return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    // Timed out waiting for late response
+    this.sendDebug(`[SFTP] No late VERSION response received`);
+    this.sendJSON({ type: 'sftp_error', message: 'SFTP 版本协商超时' });
   }
 
   // Called when CHANNEL_DATA is received for the SFTP channel

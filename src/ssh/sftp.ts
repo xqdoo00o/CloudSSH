@@ -50,6 +50,9 @@ export class SFTPClient {
   private version: number = 0;
   private sendData: ((data: Uint8Array) => void) | null = null;
   private debugFn: ((message: string) => void) | null = null;
+  private versionResolve: ((data: Uint8Array) => void) | null = null;
+  private versionTimedOut: boolean = false;
+  private versionCallback: ((version: number) => void) | null = null;
 
   setSendCallback(fn: (data: Uint8Array) => void): void {
     this.sendData = fn;
@@ -57,6 +60,10 @@ export class SFTPClient {
 
   setDebugCallback(fn: (message: string) => void): void {
     this.debugFn = fn;
+  }
+
+  setVersionCallback(fn: (version: number) => void): void {
+    this.versionCallback = fn;
   }
 
   private debug(message: string): void {
@@ -118,6 +125,13 @@ export class SFTPClient {
     if (type === SSH_FXP_VERSION) {
       this.version = readUint32(data, 1);
       this.debug(`[SFTP] VERSION: ${this.version}`);
+
+      // Call version callback if set
+      if (this.versionCallback) {
+        this.debug(`[SFTP] Calling version callback`);
+        this.versionCallback(this.version);
+      }
+
       // Resolve the init request
       const req = this.pendingRequests.get(0);
       if (req) {
@@ -125,6 +139,11 @@ export class SFTPClient {
         if (req.timeout) clearTimeout(req.timeout);
         this.pendingRequests.delete(0);
         req.resolve(data);
+      } else if (this.versionResolve) {
+        // Late VERSION response after timeout - still resolve
+        this.debug(`[SFTP] Late VERSION response, resolving`);
+        this.versionResolve(data);
+        this.versionResolve = null;
       } else {
         this.debug(`[SFTP] No pending request for id=0`);
       }
@@ -175,10 +194,17 @@ export class SFTPClient {
   // Wait for init/version exchange
   async waitForVersion(): Promise<number> {
     this.debug(`[SFTP] waitForVersion: pending=${this.pendingRequests.size}`);
+    this.versionTimedOut = false;
+
     const data = await new Promise<Uint8Array>((resolve, reject) => {
+      // Store resolve for late VERSION responses
+      this.versionResolve = resolve;
+
       const timeout = setTimeout(() => {
         this.debug(`[SFTP] waitForVersion TIMEOUT ${REQUEST_TIMEOUT_MS}ms`);
         this.pendingRequests.delete(0);
+        this.versionTimedOut = true;
+        // Don't clear versionResolve - allow late response to resolve
         reject(new Error('SFTP version timeout'));
       }, REQUEST_TIMEOUT_MS);
       this.pendingRequests.set(0, { requestId: 0, type: SSH_FXP_INIT, resolve, reject, timeout });
@@ -187,6 +213,7 @@ export class SFTPClient {
 
     this.version = readUint32(data, 1);
     this.debug(`[SFTP] waitForVersion: version=${this.version}`);
+    this.versionResolve = null;
     return this.version;
   }
 
