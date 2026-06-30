@@ -41,7 +41,7 @@ import {
 
 const SFTP_VERSION = 3;
 const DEFAULT_READ_SIZE = 32768;
-const REQUEST_TIMEOUT_MS = 30000;
+const REQUEST_TIMEOUT_MS = 60000; // 60 seconds for SFTP operations
 
 export class SFTPClient {
   private requestId: number = 0;
