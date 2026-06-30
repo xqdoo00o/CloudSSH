@@ -50,9 +50,14 @@ export class SFTPHandler {
 
   // SFTP channel data send (wraps SFTP packets in CHANNEL_DATA)
   private channelDataSend = (data: Uint8Array) => {
+    console.log(`[SFTP-Handler] channelDataSend: dataLen=${data.length}, firstBytes=[${Array.from(data.slice(0, 10)).join(',')}]`);
     const chunk = this.channel.takeChannelDataChunk(data);
     if (chunk) {
-      this.sendEncrypted(this.buildChannelDataPacket(chunk));
+      const packet = this.buildChannelDataPacket(chunk);
+      console.log(`[SFTP-Handler] Built CHANNEL_DATA packet: len=${packet.length}, type=${packet[0]}`);
+      this.sendEncrypted(packet);
+    } else {
+      console.warn(`[SFTP-Handler] channelDataSend: takeChannelDataChunk returned null!`);
     }
   };
 
@@ -107,19 +112,26 @@ export class SFTPHandler {
   // Called when CHANNEL_SUCCESS is received for the SFTP subsystem request
   async onSubsystemReady(): Promise<void> {
     const initPacket = this.sftp.buildInit();
+    console.log(`[SFTP] onSubsystemReady: initPacket length=${initPacket.length}, bytes=[${Array.from(initPacket).join(',')}]`);
+
+    console.log(`[SFTP] Sending init packet via channelDataSend...`);
     this.channelDataSend(initPacket);
 
     try {
+      console.log(`[SFTP] Waiting for version response...`);
       await this.sftp.waitForVersion();
       this.ready = true;
+      console.log(`[SFTP] Version negotiation successful`);
       this.sendJSON({ type: 'sftp_ready' });
     } catch (e) {
+      console.error(`[SFTP] Version negotiation failed:`, e);
       this.sendJSON({ type: 'sftp_error', message: 'SFTP 版本协商失败: ' + (e instanceof Error ? e.message : String(e)) });
     }
   }
 
   // Called when CHANNEL_DATA is received for the SFTP channel
   onChannelData(data: Uint8Array): void {
+    console.log(`[SFTP] onChannelData: dataLen=${data.length}, firstBytes=[${Array.from(data.slice(0, 10)).join(',')}]`);
     this.sftp.feed(data);
     this.sftp.processReceivedPackets();
   }

@@ -938,6 +938,7 @@ export class SSHSession {
           return;
         }
         channel.handleOpenConfirmation(payload);
+        this.sendDebug(`CHANNEL_OPEN_CONFIRMATION: channelID=${channelID}, remoteChannelID=${channel.getRemoteChannelID()}, isSFTP=${this.sftpHandler && channelID === this.sftpHandler.getChannelID()}`);
 
         if (channel === this.shellChannel) {
           // Shell channel: send PTY request
@@ -945,6 +946,7 @@ export class SSHSession {
           await this.sendEncrypted(ptyReq);
         } else if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
           // SFTP channel: send subsystem request
+          this.sendDebug(`SFTP channel confirmed, sending subsystem request`);
           const subsystemReq = channel.buildSubsystemRequest('sftp');
           await this.sendEncrypted(subsystemReq);
         }
@@ -996,6 +998,7 @@ export class SSHSession {
           this.sendStatus('Shell 已就绪');
         } else if (this.sftpHandler) {
           // SFTP subsystem request confirmed - send SFTP init
+          this.sendDebug(`SFTP CHANNEL_SUCCESS received, calling onSubsystemReady`);
           await this.sftpHandler.onSubsystemReady();
         }
         break;
@@ -1037,6 +1040,7 @@ export class SSHSession {
         } else if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
           // SFTP channel data - forward to SFTP handler
           const sftpData = channel.handleChannelData(payload);
+          this.sendDebug(`SFTP CHANNEL_DATA received: channelID=${channelID}, dataLen=${sftpData.length}, firstByte=${sftpData[0]}`);
           this.sftpHandler.onChannelData(sftpData);
           this.queueLocalWindowAdjust(sftpData.length, channel);
         }
@@ -1228,18 +1232,23 @@ export class SSHSession {
     this.sftpHandler = new SFTPHandler(
       channelID,
       sftpChannel,
-      (payload: Uint8Array) => this.sendEncrypted(payload),
+      (payload: Uint8Array) => {
+        this.sendDebug(`SFTP sendEncrypted: payloadLen=${payload.length}, type=${payload[0]}`);
+        return this.sendEncrypted(payload);
+      },
       (msg: any) => {
+        this.sendDebug(`SFTP sendJSON: type=${msg.type}`);
         try { this.ws.send(JSON.stringify(msg)); } catch {}
       },
       (data: Uint8Array) => {
+        this.sendDebug(`SFTP sendBinary: len=${data.length}`);
         try { this.ws.send(data); } catch {}
       }
     );
 
     const openMsg = sftpChannel.buildOpenSession(channelID);
     await this.sendEncrypted(openMsg);
-    this.sendDebug(`SFTP channel open requested, channelID=${channelID}`);
+    this.sendDebug(`SFTP channel open requested, channelID=${channelID}, channels count=${this.channels.size}`);
   }
 
   private closeSFTPChannel(): void {

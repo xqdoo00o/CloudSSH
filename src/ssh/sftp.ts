@@ -65,7 +65,7 @@ export class SFTPClient {
 
   // Build SFTP init packet
   buildInit(): Uint8Array {
-    const packet = new Uint8Array(5);
+    const packet = new Uint8Array(9); // 4 (length) + 1 (type) + 4 (version)
     writeUint32(packet, 0, 1 + 4); // length = type(1) + version(4)
     packet[4] = SSH_FXP_INIT;
     writeUint32(packet, 5, SFTP_VERSION);
@@ -82,32 +82,42 @@ export class SFTPClient {
 
   // Try to extract and dispatch complete SFTP packets from the buffer
   processReceivedPackets(): void {
+    console.log(`[SFTP-Client] processReceivedPackets: bufferLen=${this.recvBuffer.length}`);
     while (this.recvBuffer.length >= 4) {
       const packetLen = readUint32(this.recvBuffer, 0);
       const totalLen = 4 + packetLen;
 
+      console.log(`[SFTP-Client] Found packet: packetLen=${packetLen}, totalLen=${totalLen}, bufferLen=${this.recvBuffer.length}`);
+
       if (this.recvBuffer.length < totalLen) {
+        console.log(`[SFTP-Client] Incomplete packet, waiting for more data`);
         break; // incomplete packet
       }
 
       const packetData = this.recvBuffer.subarray(4, totalLen);
       this.recvBuffer = this.recvBuffer.slice(totalLen);
 
+      console.log(`[SFTP-Client] Processing packet: type=${packetData[0]}, len=${packetData.length}`);
       this.handleSFTPPacket(packetData);
     }
   }
 
   private handleSFTPPacket(data: Uint8Array): void {
     const type = data[0];
+    console.log(`[SFTP-Client] handleSFTPPacket: type=${type}, dataLen=${data.length}`);
 
     if (type === SSH_FXP_VERSION) {
       this.version = readUint32(data, 1);
+      console.log(`[SFTP-Client] SSH_FXP_VERSION received: version=${this.version}`);
       // Resolve the init request
       const req = this.pendingRequests.get(0);
       if (req) {
+        console.log(`[SFTP-Client] Resolving init request (id=0)`);
         if (req.timeout) clearTimeout(req.timeout);
         this.pendingRequests.delete(0);
         req.resolve(data);
+      } else {
+        console.warn(`[SFTP-Client] No pending request found for id=0`);
       }
       return;
     }
@@ -155,15 +165,19 @@ export class SFTPClient {
 
   // Wait for init/version exchange
   async waitForVersion(): Promise<number> {
+    console.log(`[SFTP-Client] waitForVersion: setting up pending request (id=0), pendingRequests count=${this.pendingRequests.size}`);
     const data = await new Promise<Uint8Array>((resolve, reject) => {
       const timeout = setTimeout(() => {
+        console.error(`[SFTP-Client] waitForVersion TIMEOUT after ${REQUEST_TIMEOUT_MS}ms`);
         this.pendingRequests.delete(0);
         reject(new Error('SFTP version timeout'));
       }, REQUEST_TIMEOUT_MS);
       this.pendingRequests.set(0, { requestId: 0, type: SSH_FXP_INIT, resolve, reject, timeout });
+      console.log(`[SFTP-Client] waitForVersion: pending request registered`);
     });
 
     this.version = readUint32(data, 1);
+    console.log(`[SFTP-Client] waitForVersion: resolved with version=${this.version}`);
     return this.version;
   }
 
