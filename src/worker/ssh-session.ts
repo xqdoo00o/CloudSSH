@@ -11,9 +11,11 @@ import {
   SSH_MSG_REQUEST_FAILURE,
   SSH_MSG_REQUEST_SUCCESS,
   SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
+  SSH_MSG_CHANNEL_OPEN_FAILURE,
   SSH_MSG_CHANNEL_SUCCESS,
   SSH_MSG_CHANNEL_FAILURE,
   SSH_MSG_CHANNEL_DATA,
+  SSH_MSG_CHANNEL_EXTENDED_DATA,
   SSH_MSG_CHANNEL_WINDOW_ADJUST,
   SSH_MSG_CHANNEL_EOF,
   SSH_MSG_CHANNEL_CLOSE,
@@ -21,7 +23,6 @@ import {
   SSH_MSG_IGNORE,
   SSH_MSG_DEBUG,
   SSH_MSG_UNIMPLEMENTED,
-  SSH_MSG_CHANNEL_OPEN_FAILURE,
 } from '../types';
 import { SSHTransport } from '../ssh/transport';
 import { SSHPacketParser, SSHPacketBuilder } from '../ssh/packet';
@@ -43,6 +44,7 @@ import { KeyDerivation } from '../ssh/keys';
 import { SSHAESCTRCipher, SSHAESGCMCipher, SSHHMAC } from '../ssh/crypto';
 import { SSHAuth } from '../ssh/auth';
 import { SSHChannel, type ChannelDataChunk } from '../ssh/channel';
+import { SFTPHandler, type SFTPMessage } from './sftp-handler';
 
 const LOCAL_WINDOW_ADJUST_THRESHOLD = 512 * 1024;
 
@@ -55,7 +57,11 @@ export class SSHSession {
 
   private transport: SSHTransport;
   private packetParser: SSHPacketParser;
-  private channel: SSHChannel;
+  private channels: Map<number, SSHChannel> = new Map();
+  private shellChannel: SSHChannel;
+  private nextChannelID: number = 0;
+  private sftpHandler: SFTPHandler | null = null;
+  private sftpUploadActive: boolean = false;
   private encryptCipher: SSHAESGCMCipher | SSHAESCTRCipher | null = null;
   private decryptCipher: SSHAESGCMCipher | SSHAESCTRCipher | null = null;
   private encryptMac: SSHHMAC | null = null;
@@ -114,7 +120,8 @@ export class SSHSession {
 
     this.transport = new SSHTransport();
     this.packetParser = new SSHPacketParser();
-    this.channel = new SSHChannel();
+    this.shellChannel = new SSHChannel();
+    this.channels.set(0, this.shellChannel);
     this.updateTerminalSize(config.cols, config.rows);
   }
 
@@ -276,7 +283,7 @@ export class SSHSession {
     );
   }
 
-  private async buildEncryptedChannelDataPacket(chunk: ChannelDataChunk): Promise<Uint8Array> {
+  private async buildEncryptedChannelDataPacket(chunk: ChannelDataChunk, channel: SSHChannel): Promise<Uint8Array> {
     if (!this.encryptCipher) {
       throw new Error('Encryption not initialized');
     }
@@ -284,7 +291,7 @@ export class SSHSession {
     const cipher = getCipherSpec(this.negotiatedCipherC2S);
     return SSHPacketBuilder.buildWithPayloadWriter(
       chunk.payloadLength,
-      (packet, offset) => this.channel.writeChannelDataPayload(
+      (packet, offset) => channel.writeChannelDataPayload(
         packet,
         offset,
         chunk.source,
@@ -908,30 +915,71 @@ export class SSHSession {
   }
 
   private async openShell(): Promise<void> {
-    const openMsg = this.channel.buildOpenSession();
+    const openMsg = this.shellChannel.buildOpenSession(0);
     await this.sendEncrypted(openMsg);
+  }
+
+  private getChannelIDFromPayload(payload: Uint8Array): number {
+    // Most channel messages have recipient_channel at offset 1
+    return (payload[1] << 24) | (payload[2] << 16) | (payload[3] << 8) | payload[4];
+  }
+
+  private getChannelByID(localChannelID: number): SSHChannel | undefined {
+    return this.channels.get(localChannelID);
   }
 
   private async handleSessionPacket(msgType: number, payload: Uint8Array): Promise<void> {
     switch (msgType) {
-      case SSH_MSG_CHANNEL_OPEN_CONFIRMATION:
-        this.channel.handleOpenConfirmation(payload);
-        const ptyReq = this.channel.buildPTYRequest(this.terminalSize.cols, this.terminalSize.rows);
-        await this.sendEncrypted(ptyReq);
-        break;
+      case SSH_MSG_CHANNEL_OPEN_CONFIRMATION: {
+        const channelID = this.getChannelIDFromPayload(payload);
+        const channel = this.getChannelByID(channelID);
+        if (!channel) {
+          this.sendDebug(`CHANNEL_OPEN_CONFIRMATION for unknown channel ${channelID}`);
+          return;
+        }
+        channel.handleOpenConfirmation(payload);
 
-      case SSH_MSG_CHANNEL_OPEN_FAILURE:
-        this.sendError('通道打开被拒绝');
-        this.close();
+        if (channel === this.shellChannel) {
+          // Shell channel: send PTY request
+          const ptyReq = channel.buildPTYRequest(this.terminalSize.cols, this.terminalSize.rows);
+          await this.sendEncrypted(ptyReq);
+        } else if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
+          // SFTP channel: send subsystem request
+          const subsystemReq = channel.buildSubsystemRequest('sftp');
+          await this.sendEncrypted(subsystemReq);
+        }
         break;
+      }
+
+      case SSH_MSG_CHANNEL_OPEN_FAILURE: {
+        const channelID = this.getChannelIDFromPayload(payload);
+        const reasonCode = (payload[5] << 24) | (payload[6] << 16) | (payload[7] << 8) | payload[8];
+        let offset = 9;
+        const descLen = (payload[offset] << 24) | (payload[offset+1] << 16) | (payload[offset+2] << 8) | payload[offset+3];
+        offset += 4;
+        const description = new TextDecoder().decode(payload.slice(offset, offset + descLen));
+
+        this.channels.delete(channelID);
+
+        if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
+          // SFTP channel open failed - notify frontend, don't close terminal
+          this.sendDebug(`SFTP channel open failed: reason=${reasonCode}, desc=${description}`);
+          this.ws.send(JSON.stringify({ type: 'sftp_error', message: '服务器不支持 SFTP: ' + description }));
+          this.sftpHandler = null;
+        } else {
+          // Shell channel failed - close connection
+          this.sendError('通道打开被拒绝');
+          this.close();
+        }
+        break;
+      }
 
       case SSH_MSG_CHANNEL_SUCCESS:
         if (this.state === 'shell') {
-          // PTY 请求确认，发送 shell 请求
-          const shellReq = this.channel.buildShellRequest();
+          // PTY request confirmed, send shell request
+          const shellReq = this.shellChannel.buildShellRequest();
           await this.sendEncrypted(shellReq);
           this.state = 'shell-requested';
-          // 设置超时兜底：如果服务器不发送 shell 确认，3秒后自动进入 ready
           this.shellReadyTimeout = setTimeout(() => {
             if (this.state === 'shell-requested') {
               this.state = 'ready';
@@ -939,50 +987,125 @@ export class SSHSession {
             }
           }, 3000);
         } else if (this.state === 'shell-requested') {
-          // Shell 请求确认，进入 ready 状态
+          // Shell request confirmed
           if (this.shellReadyTimeout) {
             clearTimeout(this.shellReadyTimeout);
             this.shellReadyTimeout = null;
           }
           this.state = 'ready';
           this.sendStatus('Shell 已就绪');
+        } else if (this.sftpHandler) {
+          // SFTP subsystem request confirmed - send SFTP init
+          await this.sftpHandler.onSubsystemReady();
         }
         break;
 
-      case SSH_MSG_CHANNEL_FAILURE:
-        if (this.state === 'shell' || this.state === 'shell-requested') {
+      case SSH_MSG_CHANNEL_FAILURE: {
+        const channelID = this.getChannelIDFromPayload(payload);
+        if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
+          this.ws.send(JSON.stringify({ type: 'sftp_error', message: 'SFTP subsystem 请求被拒绝' }));
+          this.sftpHandler.dispose();
+          this.sftpHandler = null;
+        } else if (this.state === 'shell' || this.state === 'shell-requested') {
           this.sendError('PTY 或 Shell 请求被拒绝');
           this.close();
         }
         break;
+      }
 
       case SSH_MSG_CHANNEL_DATA: {
-        // 某些 SSH 服务器（如 Dropbear）不会为 shell 请求发送 CHANNEL_SUCCESS，
-        // 而是直接发送 shell 输出。收到 CHANNEL_DATA 说明 shell 已就绪。
-        if (this.state === 'shell-requested') {
-          if (this.shellReadyTimeout) {
-            clearTimeout(this.shellReadyTimeout);
-            this.shellReadyTimeout = null;
-          }
-          this.state = 'ready';
-          this.sendStatus('Shell 已就绪');
+        const channelID = this.getChannelIDFromPayload(payload);
+        const channel = this.getChannelByID(channelID);
+        if (!channel) {
+          this.sendDebug(`CHANNEL_DATA for unknown channel ${channelID}`);
+          return;
         }
-        const outputData = this.channel.handleChannelData(payload);
-        this.ws.send(outputData);
-        this.queueLocalWindowAdjust(outputData.length);
+
+        if (channel === this.shellChannel) {
+          // Shell channel data - forward to terminal
+          if (this.state === 'shell-requested') {
+            if (this.shellReadyTimeout) {
+              clearTimeout(this.shellReadyTimeout);
+              this.shellReadyTimeout = null;
+            }
+            this.state = 'ready';
+            this.sendStatus('Shell 已就绪');
+          }
+          const outputData = channel.handleChannelData(payload);
+          this.ws.send(outputData);
+          this.queueLocalWindowAdjust(outputData.length, channel);
+        } else if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
+          // SFTP channel data - forward to SFTP handler
+          const sftpData = channel.handleChannelData(payload);
+          this.sftpHandler.onChannelData(sftpData);
+          this.queueLocalWindowAdjust(sftpData.length, channel);
+        }
         break;
       }
 
-      case SSH_MSG_CHANNEL_WINDOW_ADJUST:
-        this.channel.handleWindowAdjust(payload);
-        void this.flushChannelDataQueue();
-        break;
+      case SSH_MSG_CHANNEL_EXTENDED_DATA: {
+        const channelID = this.getChannelIDFromPayload(payload);
+        const channel = this.getChannelByID(channelID);
+        if (!channel) return;
 
-      case SSH_MSG_CHANNEL_EOF:
-      case SSH_MSG_CHANNEL_CLOSE:
-        this.sendStatus('会话已结束');
-        this.close(true);
+        if (channel === this.shellChannel) {
+          // stderr data from shell - forward to terminal
+          let offset = 1 + 4; // skip msgType + recipient_channel
+          const dataTypeCode = (payload[offset] << 24) | (payload[offset+1] << 16) | (payload[offset+2] << 8) | payload[offset+3];
+          offset += 4;
+          const dataLen = (payload[offset] << 24) | (payload[offset+1] << 16) | (payload[offset+2] << 8) | payload[offset+3];
+          offset += 4;
+          const stderrData = payload.slice(offset, offset + dataLen);
+          this.ws.send(stderrData);
+          this.queueLocalWindowAdjust(stderrData.length, channel);
+        }
+        // SFTP channel extended data is rare, just ignore
         break;
+      }
+
+      case SSH_MSG_CHANNEL_WINDOW_ADJUST: {
+        const channelID = this.getChannelIDFromPayload(payload);
+        const channel = this.getChannelByID(channelID);
+        if (channel) {
+          channel.handleWindowAdjust(payload);
+          if (channel === this.shellChannel) {
+            void this.flushChannelDataQueue();
+          } else if (this.sftpHandler) {
+            this.sftpHandler.onWindowAdjust();
+          }
+        }
+        break;
+      }
+
+      case SSH_MSG_CHANNEL_EOF: {
+        const channelID = this.getChannelIDFromPayload(payload);
+        if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
+          // SFTP channel EOF - mark, don't close connection
+          this.sendDebug('SFTP channel EOF received');
+          this.sftpHandler.onChannelEof();
+        } else {
+          // Shell channel EOF - close connection
+          this.sendStatus('会话已结束');
+          this.close(true);
+        }
+        break;
+      }
+
+      case SSH_MSG_CHANNEL_CLOSE: {
+        const channelID = this.getChannelIDFromPayload(payload);
+        if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
+          // SFTP channel closed - clean up, terminal continues
+          this.sendDebug('SFTP channel closed');
+          this.channels.delete(channelID);
+          this.sftpHandler.onChannelClosed();
+          this.sftpHandler = null;
+        } else {
+          // Shell channel closed - close connection
+          this.sendStatus('会话已结束');
+          this.close(true);
+        }
+        break;
+      }
 
       case SSH_MSG_DISCONNECT:
         this.sendStatus('服务器断开连接');
@@ -1012,16 +1135,129 @@ export class SSHSession {
           await this.handleResize(parsed.cols, parsed.rows);
           return;
         }
+
+        // SFTP control messages
+        if (parsed.type && parsed.type.startsWith('sftp_')) {
+          await this.handleSFTPMessage(parsed);
+          return;
+        }
       }
 
       if (this.state !== 'ready') return;
-      
+
       this.enqueueChannelData(this.textEncoder.encode(data));
     } else {
+      if (this.sftpUploadActive && this.sftpHandler) {
+        // Binary data during SFTP upload - route to SFTP handler
+        this.sftpHandler.onUploadChunk(new Uint8Array(data));
+        return;
+      }
+
       if (this.state !== 'ready') return;
 
       this.enqueueChannelData(new Uint8Array(data));
     }
+  }
+
+  private async handleSFTPMessage(msg: any): Promise<void> {
+    if (this.state !== 'ready') {
+      this.ws.send(JSON.stringify({ type: 'sftp_error', message: 'SSH 连接未就绪' }));
+      return;
+    }
+
+    if (msg.type === 'sftp_init') {
+      await this.openSFTPChannel();
+      return;
+    }
+
+    if (!this.sftpHandler) {
+      this.ws.send(JSON.stringify({ type: 'sftp_error', message: 'SFTP 未初始化，请先发送 sftp_init' }));
+      return;
+    }
+
+    switch (msg.type) {
+      case 'sftp_list':
+        await this.sftpHandler.listDirectory(msg.path || '.');
+        break;
+      case 'sftp_stat':
+        await this.sftpHandler.stat(msg.path);
+        break;
+      case 'sftp_download':
+        await this.sftpHandler.downloadFile(msg.path);
+        break;
+      case 'sftp_upload_start':
+        this.sftpUploadActive = true;
+        await this.sftpHandler.uploadStart(msg.path, msg.size || 0);
+        break;
+      case 'sftp_upload_end':
+        this.sftpUploadActive = false;
+        await this.sftpHandler.uploadEnd();
+        break;
+      case 'sftp_upload_cancel':
+        this.sftpUploadActive = false;
+        this.sftpHandler.uploadCancel();
+        break;
+      case 'sftp_delete':
+        await this.sftpHandler.deletePath(msg.path);
+        break;
+      case 'sftp_rename':
+        await this.sftpHandler.renamePath(msg.oldPath, msg.newPath);
+        break;
+      case 'sftp_mkdir':
+        await this.sftpHandler.makeDirectory(msg.path);
+        break;
+      case 'sftp_rmdir':
+        await this.sftpHandler.removeDirectory(msg.path);
+        break;
+      case 'sftp_close':
+        this.closeSFTPChannel();
+        break;
+    }
+  }
+
+  private async openSFTPChannel(): Promise<void> {
+    if (this.sftpHandler) {
+      this.ws.send(JSON.stringify({ type: 'sftp_error', message: 'SFTP 已经打开' }));
+      return;
+    }
+
+    const channelID = this.nextChannelID++;
+    const sftpChannel = new SSHChannel();
+    this.channels.set(channelID, sftpChannel);
+
+    this.sftpHandler = new SFTPHandler(
+      channelID,
+      sftpChannel,
+      (payload: Uint8Array) => this.sendEncrypted(payload),
+      (msg: any) => {
+        try { this.ws.send(JSON.stringify(msg)); } catch {}
+      },
+      (data: Uint8Array) => {
+        try { this.ws.send(data); } catch {}
+      }
+    );
+
+    const openMsg = sftpChannel.buildOpenSession(channelID);
+    await this.sendEncrypted(openMsg);
+    this.sendDebug(`SFTP channel open requested, channelID=${channelID}`);
+  }
+
+  private closeSFTPChannel(): void {
+    if (!this.sftpHandler) return;
+
+    const channelID = this.sftpHandler.getChannelID();
+    const channel = this.channels.get(channelID);
+
+    if (channel && !channel.isClosed()) {
+      const eof = channel.buildEof();
+      const close = channel.buildClose();
+      void this.sendEncrypted(eof).then(() => this.sendEncrypted(close)).catch(() => {});
+    }
+
+    this.channels.delete(channelID);
+    this.sftpHandler.dispose();
+    this.sftpHandler = null;
+    this.sftpUploadActive = false;
   }
 
   private enqueueChannelData(data: Uint8Array): void {
@@ -1038,10 +1274,10 @@ export class SSHSession {
     try {
       while (this.channelDataQueueHead < this.channelDataQueue.length) {
         const current = this.channelDataQueue[this.channelDataQueueHead];
-        const chunk = this.channel.takeChannelDataChunk(current, this.channelDataQueueOffset);
+        const chunk = this.shellChannel.takeChannelDataChunk(current, this.channelDataQueueOffset);
         if (!chunk) break;
 
-        await this.sendEncryptedChannelData(chunk);
+        await this.sendEncryptedChannelData(chunk, this.shellChannel);
         this.channelDataQueueOffset += chunk.bytesConsumed;
 
         if (this.channelDataQueueOffset >= current.length) {
@@ -1068,7 +1304,7 @@ export class SSHSession {
     if (!this.updateTerminalSize(cols, rows)) return;
     if (this.state !== 'ready') return;
 
-    const resizeMsg = this.channel.buildWindowChange(this.terminalSize.cols, this.terminalSize.rows);
+    const resizeMsg = this.shellChannel.buildWindowChange(this.terminalSize.cols, this.terminalSize.rows);
     await this.sendEncrypted(resizeMsg);
   }
 
@@ -1084,8 +1320,8 @@ export class SSHSession {
     await this.sendEncryptedPacket(() => this.buildEncryptedPacket(payload));
   }
 
-  private async sendEncryptedChannelData(chunk: ChannelDataChunk): Promise<void> {
-    await this.sendEncryptedPacket(() => this.buildEncryptedChannelDataPacket(chunk));
+  private async sendEncryptedChannelData(chunk: ChannelDataChunk, channel: SSHChannel): Promise<void> {
+    await this.sendEncryptedPacket(() => this.buildEncryptedChannelDataPacket(chunk, channel));
   }
 
   private async sendEncryptedPacket(buildPacket: () => Promise<Uint8Array>): Promise<void> {
@@ -1098,7 +1334,7 @@ export class SSHSession {
     await operation;
   }
 
-  private queueLocalWindowAdjust(bytesToAdd: number): void {
+  private queueLocalWindowAdjust(bytesToAdd: number, channel: SSHChannel): void {
     this.pendingLocalWindowAdjustBytes += bytesToAdd;
     if (this.pendingLocalWindowAdjustBytes < LOCAL_WINDOW_ADJUST_THRESHOLD) {
       return;
@@ -1106,12 +1342,12 @@ export class SSHSession {
 
     const adjustBytes = this.pendingLocalWindowAdjustBytes;
     this.pendingLocalWindowAdjustBytes = 0;
-    void this.sendLocalWindowAdjust(adjustBytes);
+    void this.sendLocalWindowAdjust(adjustBytes, channel);
   }
 
-  private async sendLocalWindowAdjust(bytesToAdd: number): Promise<void> {
+  private async sendLocalWindowAdjust(bytesToAdd: number, channel: SSHChannel): Promise<void> {
     try {
-      await this.sendEncrypted(this.channel.buildWindowAdjust(bytesToAdd));
+      await this.sendEncrypted(channel.buildWindowAdjust(bytesToAdd));
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
       this.sendDebug(`sendLocalWindowAdjust ERROR: ${errMsg}`);
@@ -1152,6 +1388,12 @@ export class SSHSession {
       clearTimeout(this.shellReadyTimeout);
       this.shellReadyTimeout = null;
     }
+    if (this.sftpHandler) {
+      this.sftpHandler.dispose();
+      this.sftpHandler = null;
+    }
+    this.sftpUploadActive = false;
+    this.channels.clear();
     this.channelDataQueue = [];
     this.channelDataQueueHead = 0;
     this.channelDataQueueOffset = 0;

@@ -125,6 +125,9 @@ export const UI_THEMES: Record<keyof typeof THEMES, Record<string, string>> = {
   },
 };
 
+export type SFTPMessageHandler = (msg: any) => void;
+export type SFTPBinaryHandler = (data: ArrayBuffer) => void;
+
 export class SSHTerminal {
   private terminal: Terminal;
   private fitAddon: FitAddon;
@@ -142,6 +145,8 @@ export class SSHTerminal {
   private lastConfig: SSHConnectionConfig | null = null;
   private onSessionClosed?: (event: CloseEvent) => void;
   private restoreCursorBlinkAfterAltScreenExit: boolean = false;
+  private sftpMessageHandler: SFTPMessageHandler | null = null;
+  private sftpBinaryHandler: SFTPBinaryHandler | null = null;
 
   constructor(containerId: string) {
     this.container = document.getElementById(containerId)!;
@@ -218,6 +223,26 @@ export class SSHTerminal {
 
   setSessionClosedHandler(handler: (event: CloseEvent) => void): void {
     this.onSessionClosed = handler;
+  }
+
+  setSFTPMessageHandler(handler: SFTPMessageHandler): void {
+    this.sftpMessageHandler = handler;
+  }
+
+  setSFTPBinaryHandler(handler: SFTPBinaryHandler): void {
+    this.sftpBinaryHandler = handler;
+  }
+
+  sendSFTPMessage(msg: any): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(msg));
+    }
+  }
+
+  sendSFTPBinary(data: ArrayBuffer): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(data);
+    }
   }
 
   mount(): void {
@@ -339,6 +364,11 @@ export class SSHTerminal {
       if (typeof event.data === 'string') {
         try {
           const msg = JSON.parse(event.data);
+          // Route SFTP messages to the SFTP panel handler
+          if (msg.type && (msg.type.startsWith('sftp_'))) {
+            this.sftpMessageHandler?.(msg);
+            return;
+          }
           switch (msg.type) {
             case 'status':
               this.terminal.writeln(`\x1b[32m[*] ${msg.message}\x1b[0m`);
@@ -362,6 +392,11 @@ export class SSHTerminal {
           this.trzszFilter!.processServerOutput(event.data);
         }
       } else {
+        // Binary data — check if SFTP download is active
+        if (this.sftpBinaryHandler) {
+          this.sftpBinaryHandler(event.data);
+          return;
+        }
         // Binary data — pass through trzsz filter
         this.trzszFilter!.processServerOutput(event.data);
       }
