@@ -125,9 +125,6 @@ export const UI_THEMES: Record<keyof typeof THEMES, Record<string, string>> = {
   },
 };
 
-export type SFTPMessageHandler = (msg: any) => void;
-export type SFTPBinaryHandler = (data: ArrayBuffer) => void;
-
 export class SSHTerminal {
   private terminal: Terminal;
   private fitAddon: FitAddon;
@@ -143,10 +140,10 @@ export class SSHTerminal {
   private maxReconnectAttempts: number = 5;
   private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
   private lastConfig: SSHConnectionConfig | null = null;
+  private restoreCursorBlinkAfterReturnPrompt: boolean = false;
   private onSessionClosed?: (event: CloseEvent) => void;
-  private restoreCursorBlinkAfterAltScreenExit: boolean = false;
-  private sftpMessageHandler: SFTPMessageHandler | null = null;
-  private sftpBinaryHandler: SFTPBinaryHandler | null = null;
+  private onSessionReady?: () => void;
+  private sftpAttachUrl: string | null = null;
 
   constructor(containerId: string) {
     this.container = document.getElementById(containerId)!;
@@ -164,7 +161,7 @@ export class SSHTerminal {
     this.fitAddon = new FitAddon();
     this.terminal.loadAddon(this.fitAddon);
     this.terminal.loadAddon(new WebLinksAddon());
-    this.registerAltScreenExitHandler();
+    this.registerCursorRestoreHandlers();
 
     window.addEventListener('resize', () => this.fit());
 
@@ -225,24 +222,12 @@ export class SSHTerminal {
     this.onSessionClosed = handler;
   }
 
-  setSFTPMessageHandler(handler: SFTPMessageHandler): void {
-    this.sftpMessageHandler = handler;
+  setSessionReadyHandler(handler: () => void): void {
+    this.onSessionReady = handler;
   }
 
-  setSFTPBinaryHandler(handler: SFTPBinaryHandler): void {
-    this.sftpBinaryHandler = handler;
-  }
-
-  sendSFTPMessage(msg: any): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(msg));
-    }
-  }
-
-  sendSFTPBinary(data: ArrayBuffer): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(data);
-    }
+  getSFTPWebSocketUrl(): string | null {
+    return this.sftpAttachUrl;
   }
 
   mount(): void {
@@ -364,11 +349,11 @@ export class SSHTerminal {
       if (typeof event.data === 'string') {
         try {
           const msg = JSON.parse(event.data);
-          // Route SFTP messages to the SFTP panel handler
-          if (msg.type && (msg.type.startsWith('sftp_'))) {
-            this.sftpMessageHandler?.(msg);
+          if (msg.type === 'sftp_attach') {
+            this.sftpAttachUrl = msg.url || null;
             return;
           }
+
           switch (msg.type) {
             case 'status':
               this.terminal.writeln(`\x1b[32m[*] ${msg.message}\x1b[0m`);
@@ -376,6 +361,9 @@ export class SSHTerminal {
                 this.reconnectAttempts = 0;
                 const statusText = document.getElementById('status-text');
                 if (statusText) statusText.innerHTML = '<span class="w-2 h-2 bg-[var(--accent)] inline-block animate-pulse"></span> STATUS: ONLINE';
+              }
+              if (msg.message === 'Shell 已就绪') {
+                this.onSessionReady?.();
               }
               break;
             case 'error':
@@ -392,12 +380,6 @@ export class SSHTerminal {
           this.trzszFilter!.processServerOutput(event.data);
         }
       } else {
-        // Binary data — check if SFTP download is active
-        if (this.sftpBinaryHandler) {
-          this.sftpBinaryHandler(event.data);
-          return;
-        }
-        // Binary data — pass through trzsz filter
         this.trzszFilter!.processServerOutput(event.data);
       }
     };
@@ -481,11 +463,11 @@ export class SSHTerminal {
     }
   }
 
-  private registerAltScreenExitHandler(): void {
+  private registerCursorRestoreHandlers(): void {
     this.terminalDisposables.push(
-      this.terminal.parser.registerCsiHandler({ prefix: '?', final: 'l' }, (params) => {
-        if (this.hasAltScreenExitParam(params)) {
-          this.restoreCursorBlinkAfterAltScreenExit = true;
+      this.terminal.parser.registerCsiHandler({ prefix: '?', final: 'h' }, (params) => {
+        if (params[0] === 2004 && this.terminal.buffer.active.type === 'normal') {
+          this.restoreCursorBlinkAfterReturnPrompt = true;
         }
         return false;
       })
@@ -493,18 +475,11 @@ export class SSHTerminal {
 
     this.terminalDisposables.push(
       this.terminal.onWriteParsed(() => {
-        if (!this.restoreCursorBlinkAfterAltScreenExit) return;
-        this.restoreCursorBlinkAfterAltScreenExit = false;
+        if (!this.restoreCursorBlinkAfterReturnPrompt) return;
+        this.restoreCursorBlinkAfterReturnPrompt = false;
         this.terminal.options.cursorBlink = true;
       })
     );
-  }
-
-  private hasAltScreenExitParam(params: (number | number[])[]): boolean {
-    return params.some((param) => {
-      const values = Array.isArray(param) ? param : [param];
-      return values.some(value => value === 47 || value === 1047 || value === 1049);
-    });
   }
 
   private resetTerminalDisplay(): void {
@@ -548,6 +523,7 @@ export class SSHTerminal {
 
     const socket = this.ws;
     this.ws = null;
+    this.sftpAttachUrl = null;
     this.trzszFilter = null;
 
     if (socket && socket.readyState !== WebSocket.CLOSED && socket.readyState !== WebSocket.CLOSING) {
