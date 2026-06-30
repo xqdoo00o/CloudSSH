@@ -1083,30 +1083,34 @@ export class SSHSession {
 
       case SSH_MSG_CHANNEL_EOF: {
         const channelID = this.getChannelIDFromPayload(payload);
-        if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
-          // SFTP channel EOF - mark, don't close connection
-          this.sendDebug('SFTP channel EOF received');
-          this.sftpHandler.onChannelEof();
-        } else {
+        if (channelID === this.shellChannel.getLocalChannelID()) {
           // Shell channel EOF - close connection
           this.sendStatus('会话已结束');
           this.close(true);
+        } else {
+          // Other channel (SFTP etc.) EOF - don't close connection
+          this.sendDebug(`Non-shell channel EOF: channelID=${channelID}`);
+          if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
+            this.sftpHandler.onChannelEof();
+          }
         }
         break;
       }
 
       case SSH_MSG_CHANNEL_CLOSE: {
         const channelID = this.getChannelIDFromPayload(payload);
-        if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
-          // SFTP channel closed - clean up, terminal continues
-          this.sendDebug('SFTP channel closed');
-          this.channels.delete(channelID);
-          this.sftpHandler.onChannelClosed();
-          this.sftpHandler = null;
-        } else {
+        if (channelID === this.shellChannel.getLocalChannelID()) {
           // Shell channel closed - close connection
           this.sendStatus('会话已结束');
           this.close(true);
+        } else {
+          // Other channel (SFTP etc.) closed - clean up that channel only
+          this.sendDebug(`Non-shell channel closed: channelID=${channelID}`);
+          this.channels.delete(channelID);
+          if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
+            this.sftpHandler.onChannelClosed();
+            this.sftpHandler = null;
+          }
         }
         break;
       }

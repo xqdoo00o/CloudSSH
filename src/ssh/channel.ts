@@ -76,6 +76,7 @@ export class SSHChannel {
     if (serverMaxPacket > 0) {
       this.maxPacketSize = Math.min(this.maxPacketSize, serverMaxPacket);
     }
+    console.log(`[SSHChannel] handleOpenConfirmation: localChannelID=${this.localChannelID}, remoteChannelID=${this.remoteChannelID}, remoteWindowSize=${this.remoteWindowSize}, maxPacketSize=${this.maxPacketSize}`);
   }
 
   buildPTYRequest(cols: number, rows: number): Uint8Array {

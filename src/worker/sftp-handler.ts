@@ -49,15 +49,18 @@ export class SFTPHandler {
   private uploadPath: string = '';
 
   // SFTP channel data send (wraps SFTP packets in CHANNEL_DATA)
-  private channelDataSend = (data: Uint8Array) => {
+  private channelDataSend = (data: Uint8Array): void => {
     console.log(`[SFTP-Handler] channelDataSend: dataLen=${data.length}, firstBytes=[${Array.from(data.slice(0, 10)).join(',')}]`);
     const chunk = this.channel.takeChannelDataChunk(data);
     if (chunk) {
       const packet = this.buildChannelDataPacket(chunk);
-      console.log(`[SFTP-Handler] Built CHANNEL_DATA packet: len=${packet.length}, type=${packet[0]}`);
-      this.sendEncrypted(packet);
+      console.log(`[SFTP-Handler] Built CHANNEL_DATA packet: len=${packet.length}, type=${packet[0]}, remoteChannelID=${this.channel.getRemoteChannelID()}`);
+      // Fire and forget - sendEncrypted handles ordering via mutex
+      this.sendEncrypted(packet).catch(err => {
+        console.error(`[SFTP-Handler] channelDataSend failed:`, err);
+      });
     } else {
-      console.warn(`[SFTP-Handler] channelDataSend: takeChannelDataChunk returned null!`);
+      console.warn(`[SFTP-Handler] channelDataSend: takeChannelDataChunk returned null! Check remoteWindowSize`);
     }
   };
 
