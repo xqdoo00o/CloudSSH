@@ -1237,7 +1237,7 @@ export class SSHSession {
       channelID,
       sftpChannel,
       (payload: Uint8Array) => {
-        this.sendDebug(`SFTP sendEncrypted: payloadLen=${payload.length}, type=${payload[0]}`);
+        this.sendDebug(`SFTP sendEncrypted: len=${payload.length}, type=${payload[0]}`);
         return this.sendEncrypted(payload);
       },
       (msg: any) => {
@@ -1247,6 +1247,9 @@ export class SSHSession {
       (data: Uint8Array) => {
         this.sendDebug(`SFTP sendBinary: len=${data.length}`);
         try { this.ws.send(data); } catch {}
+      },
+      (message: string) => {
+        this.sendDebug(message);
       }
     );
 

@@ -32,6 +32,7 @@ const MAX_FILE_SIZE = 500 * 1024 * 1024; // 500MB limit
 type SendEncryptedFn = (payload: Uint8Array) => Promise<void>;
 type SendJSONFn = (msg: any) => void;
 type SendBinaryFn = (data: Uint8Array) => void;
+type SendDebugFn = (message: string) => void;
 
 export class SFTPHandler {
   private channelID: number;
@@ -40,6 +41,7 @@ export class SFTPHandler {
   private sendEncrypted: SendEncryptedFn;
   private sendJSON: SendJSONFn;
   private sendBinary: SendBinaryFn;
+  private sendDebug: SendDebugFn;
   private ready: boolean = false;
 
   // Upload state
@@ -50,17 +52,17 @@ export class SFTPHandler {
 
   // SFTP channel data send (wraps SFTP packets in CHANNEL_DATA)
   private channelDataSend = (data: Uint8Array): void => {
-    console.log(`[SFTP-Handler] channelDataSend: dataLen=${data.length}, firstBytes=[${Array.from(data.slice(0, 10)).join(',')}]`);
+    this.sendDebug(`[SFTP] channelDataSend: dataLen=${data.length}`);
     const chunk = this.channel.takeChannelDataChunk(data);
     if (chunk) {
       const packet = this.buildChannelDataPacket(chunk);
-      console.log(`[SFTP-Handler] Built CHANNEL_DATA packet: len=${packet.length}, type=${packet[0]}, remoteChannelID=${this.channel.getRemoteChannelID()}`);
+      this.sendDebug(`[SFTP] Built CHANNEL_DATA: len=${packet.length}, remoteChID=${this.channel.getRemoteChannelID()}`);
       // Fire and forget - sendEncrypted handles ordering via mutex
       this.sendEncrypted(packet).catch(err => {
-        console.error(`[SFTP-Handler] channelDataSend failed:`, err);
+        this.sendDebug(`[SFTP] channelDataSend FAILED: ${err}`);
       });
     } else {
-      console.warn(`[SFTP-Handler] channelDataSend: takeChannelDataChunk returned null! Check remoteWindowSize`);
+      this.sendDebug(`[SFTP] channelDataSend: takeChannelDataChunk returned null!`);
     }
   };
 
@@ -87,6 +89,7 @@ export class SFTPHandler {
     sendEncrypted: SendEncryptedFn,
     sendJSON: SendJSONFn,
     sendBinary: SendBinaryFn,
+    sendDebug: SendDebugFn,
   ) {
     this.channelID = channelID;
     this.channel = channel;
@@ -94,8 +97,10 @@ export class SFTPHandler {
     this.sendEncrypted = sendEncrypted;
     this.sendJSON = sendJSON;
     this.sendBinary = sendBinary;
+    this.sendDebug = sendDebug;
 
     this.sftp.setSendCallback(this.channelDataSend);
+    this.sftp.setDebugCallback(sendDebug);
   }
 
   getChannelID(): number {
@@ -115,26 +120,26 @@ export class SFTPHandler {
   // Called when CHANNEL_SUCCESS is received for the SFTP subsystem request
   async onSubsystemReady(): Promise<void> {
     const initPacket = this.sftp.buildInit();
-    console.log(`[SFTP] onSubsystemReady: initPacket length=${initPacket.length}, bytes=[${Array.from(initPacket).join(',')}]`);
+    this.sendDebug(`[SFTP] onSubsystemReady: initLen=${initPacket.length}, bytes=[${Array.from(initPacket).join(',')}]`);
 
-    console.log(`[SFTP] Sending init packet via channelDataSend...`);
+    this.sendDebug(`[SFTP] Sending init packet...`);
     this.channelDataSend(initPacket);
 
     try {
-      console.log(`[SFTP] Waiting for version response...`);
+      this.sendDebug(`[SFTP] Waiting for version...`);
       await this.sftp.waitForVersion();
       this.ready = true;
-      console.log(`[SFTP] Version negotiation successful`);
+      this.sendDebug(`[SFTP] Version OK`);
       this.sendJSON({ type: 'sftp_ready' });
     } catch (e) {
-      console.error(`[SFTP] Version negotiation failed:`, e);
+      this.sendDebug(`[SFTP] Version FAILED: ${e instanceof Error ? e.message : String(e)}`);
       this.sendJSON({ type: 'sftp_error', message: 'SFTP 版本协商失败: ' + (e instanceof Error ? e.message : String(e)) });
     }
   }
 
   // Called when CHANNEL_DATA is received for the SFTP channel
   onChannelData(data: Uint8Array): void {
-    console.log(`[SFTP] onChannelData: dataLen=${data.length}, firstBytes=[${Array.from(data.slice(0, 10)).join(',')}]`);
+    this.sendDebug(`[SFTP] onChannelData: len=${data.length}, first=[${Array.from(data.slice(0, 5)).join(',')}]`);
     this.sftp.feed(data);
     this.sftp.processReceivedPackets();
   }

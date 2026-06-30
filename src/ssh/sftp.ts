@@ -49,9 +49,18 @@ export class SFTPClient {
   private recvBuffer: Uint8Array = new Uint8Array(0);
   private version: number = 0;
   private sendData: ((data: Uint8Array) => void) | null = null;
+  private debugFn: ((message: string) => void) | null = null;
 
   setSendCallback(fn: (data: Uint8Array) => void): void {
     this.sendData = fn;
+  }
+
+  setDebugCallback(fn: (message: string) => void): void {
+    this.debugFn = fn;
+  }
+
+  private debug(message: string): void {
+    if (this.debugFn) this.debugFn(message);
   }
 
   dispose(): void {
@@ -82,42 +91,42 @@ export class SFTPClient {
 
   // Try to extract and dispatch complete SFTP packets from the buffer
   processReceivedPackets(): void {
-    console.log(`[SFTP-Client] processReceivedPackets: bufferLen=${this.recvBuffer.length}`);
+    this.debug(`[SFTP] processReceived: bufLen=${this.recvBuffer.length}`);
     while (this.recvBuffer.length >= 4) {
       const packetLen = readUint32(this.recvBuffer, 0);
       const totalLen = 4 + packetLen;
 
-      console.log(`[SFTP-Client] Found packet: packetLen=${packetLen}, totalLen=${totalLen}, bufferLen=${this.recvBuffer.length}`);
+      this.debug(`[SFTP] Found packet: len=${packetLen}, total=${totalLen}, buf=${this.recvBuffer.length}`);
 
       if (this.recvBuffer.length < totalLen) {
-        console.log(`[SFTP-Client] Incomplete packet, waiting for more data`);
+        this.debug(`[SFTP] Incomplete, waiting`);
         break; // incomplete packet
       }
 
       const packetData = this.recvBuffer.subarray(4, totalLen);
       this.recvBuffer = this.recvBuffer.slice(totalLen);
 
-      console.log(`[SFTP-Client] Processing packet: type=${packetData[0]}, len=${packetData.length}`);
+      this.debug(`[SFTP] Processing: type=${packetData[0]}, len=${packetData.length}`);
       this.handleSFTPPacket(packetData);
     }
   }
 
   private handleSFTPPacket(data: Uint8Array): void {
     const type = data[0];
-    console.log(`[SFTP-Client] handleSFTPPacket: type=${type}, dataLen=${data.length}`);
+    this.debug(`[SFTP] handlePacket: type=${type}, len=${data.length}`);
 
     if (type === SSH_FXP_VERSION) {
       this.version = readUint32(data, 1);
-      console.log(`[SFTP-Client] SSH_FXP_VERSION received: version=${this.version}`);
+      this.debug(`[SFTP] VERSION: ${this.version}`);
       // Resolve the init request
       const req = this.pendingRequests.get(0);
       if (req) {
-        console.log(`[SFTP-Client] Resolving init request (id=0)`);
+        this.debug(`[SFTP] Resolving init (id=0)`);
         if (req.timeout) clearTimeout(req.timeout);
         this.pendingRequests.delete(0);
         req.resolve(data);
       } else {
-        console.warn(`[SFTP-Client] No pending request found for id=0`);
+        this.debug(`[SFTP] No pending request for id=0`);
       }
       return;
     }
@@ -165,19 +174,19 @@ export class SFTPClient {
 
   // Wait for init/version exchange
   async waitForVersion(): Promise<number> {
-    console.log(`[SFTP-Client] waitForVersion: setting up pending request (id=0), pendingRequests count=${this.pendingRequests.size}`);
+    this.debug(`[SFTP] waitForVersion: pending=${this.pendingRequests.size}`);
     const data = await new Promise<Uint8Array>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        console.error(`[SFTP-Client] waitForVersion TIMEOUT after ${REQUEST_TIMEOUT_MS}ms`);
+        this.debug(`[SFTP] waitForVersion TIMEOUT ${REQUEST_TIMEOUT_MS}ms`);
         this.pendingRequests.delete(0);
         reject(new Error('SFTP version timeout'));
       }, REQUEST_TIMEOUT_MS);
       this.pendingRequests.set(0, { requestId: 0, type: SSH_FXP_INIT, resolve, reject, timeout });
-      console.log(`[SFTP-Client] waitForVersion: pending request registered`);
+      this.debug(`[SFTP] waitForVersion: registered`);
     });
 
     this.version = readUint32(data, 1);
-    console.log(`[SFTP-Client] waitForVersion: resolved with version=${this.version}`);
+    this.debug(`[SFTP] waitForVersion: version=${this.version}`);
     return this.version;
   }
 
